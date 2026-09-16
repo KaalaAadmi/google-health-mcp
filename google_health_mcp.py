@@ -17,12 +17,8 @@ Environment variables the server needs (set on your host):
   GOOGLE_REFRESH_TOKEN   printed by get_refresh_token.py
   PORT                   injected by the host (Cloud Run sets 8080)
 
-Confirm before first run (all isolated in CONFIG, override via env):
-  1. API_BASE  -> https://developers.google.com/health/reference/rest
-  2. SCOPES    -> https://developers.google.com/health/scopes
-  3. PARAM_*   -> https://developers.google.com/health/filters  +  .../endpoints
-Google ships an LLM-ready context file to fill these exactly:
-  https://developers.google.com/health/migration/parity-tool
+Verified against the live API: host https://health.googleapis.com/v4, the
+googlehealth.* read scopes, and AIP-160 filter expressions (see _filter_field).
 """
 from __future__ import annotations
 
@@ -36,6 +32,7 @@ import httpx
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # ─────────────────────────── CONFIG (confirm these) ──────────────────────────
 API_BASE = os.environ.get("HEALTH_API_BASE", "https://health.googleapis.com/v4")
@@ -48,12 +45,12 @@ SCOPES = [
     f"{_SCOPE_PREFIX}.nutrition.readonly",
 ]
 
-PARAM_START = os.environ.get("HEALTH_PARAM_START", "startTime")
-PARAM_END = os.environ.get("HEALTH_PARAM_END", "endTime")
-
-# API caps aggregation ranges: 14 days for these, 90 for everything else.
-SHORT_WINDOW_TYPES = {
-    "heart-rate", "active-minutes", "total-calories", "calories-in-heart-rate-zone",
+# Google Health list() uses AIP-160 filter expressions, NOT startTime/endTime.
+# The time field depends on the data type's record type, and multi-word types use
+# UNDERSCORES in the filter (the URL path uses hyphens). Sample-type data types:
+SAMPLE_TYPES = {
+    "heart-rate", "heart-rate-variability", "oxygen-saturation", "blood-glucose",
+    "core-body-temperature", "respiratory-rate-sleep-summary", "weight", "body-fat",
 }
 # Response envelope key varies by endpoint; grab the first list-shaped field.
 LIST_KEYS = ("dataPoints", "dailyRollupDataPoints", "rollupDataPoints", "sessions")
@@ -61,12 +58,15 @@ LIST_KEYS = ("dataPoints", "dailyRollupDataPoints", "rollupDataPoints", "session
 
 # stateless_http + json_response => robust on scale-to-zero / multi-instance
 # hosts like Cloud Run (no server-side session to lose on a cold start).
+# The transport's DNS-rebinding guard only accepts localhost Host headers by
+# default and 421s Cloud Run's *.run.app host. That guard protects LOCAL servers
+# from browser-driven attacks; this endpoint is public + authless behind HTTPS,
+# so it isn't the relevant control here. Disable it so the run.app host is served.
 mcp = FastMCP(
     "google-health",
     stateless_http=True,
     json_response=True,
-    host="0.0.0.0",                               # bind all interfaces (Cloud Run)
-    port=int(os.environ.get("PORT", "8080")),     # Cloud Run injects PORT
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 
@@ -129,20 +129,25 @@ def _get(path: str, params: dict[str, Any]) -> list[dict]:
             params["pageToken"] = next_token
 
 
-# ── time helpers ──────────────────────────────────────────────────────────────
-def _rfc3339(t: dt.datetime) -> str:
-    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _window(days: int) -> dict[str, str]:
-    end = dt.datetime.now(dt.timezone.utc)
-    return {PARAM_START: _rfc3339(end - dt.timedelta(days=days)), PARAM_END: _rfc3339(end)}
+# ── filter construction (AIP-160) ─────────────────────────────────────────────
+def _filter_field(data_type: str) -> str:
+    """The filter time field for a data type, keyed on its record type.
+    Uses civil (calendar-date) fields, which accept a plain YYYY-MM-DD literal."""
+    u = data_type.replace("-", "_")            # filter identifiers use underscores
+    if data_type.startswith("daily-"):
+        return f"{u}.date"                     # Daily record type
+    if data_type in SAMPLE_TYPES:
+        return f"{u}.sample_time.civil_time"    # Sample record type
+    return f"{u}.interval.civil_start_time"     # Interval + session (exercise, sleep)
 
 
 def _points(data_type: str, days: int) -> list[dict]:
-    if data_type in SHORT_WINDOW_TYPES:
-        days = min(days, 14)
-    return _get(f"/users/me/dataTypes/{data_type}/dataPoints", _window(days))
+    today = dt.datetime.now(dt.timezone.utc).date()
+    start = (today - dt.timedelta(days=days)).isoformat()
+    end = (today + dt.timedelta(days=1)).isoformat()          # exclusive; includes today
+    field = _filter_field(data_type)
+    flt = f'{field} >= "{start}" AND {field} < "{end}"'       # httpx URL-encodes this
+    return _get(f"/users/me/dataTypes/{data_type}/dataPoints", {"filter": flt})
 
 
 # ── MCP tools ─────────────────────────────────────────────────────────────────
@@ -194,4 +199,13 @@ def get_workouts(days: int = 14) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    import uvicorn
+
+    # Bind host/port explicitly via uvicorn rather than through FastMCP settings,
+    # so it works the same across mcp versions. streamable_http_app() carries the
+    # stateless_http / json_response settings set on the FastMCP instance above.
+    uvicorn.run(
+        mcp.streamable_http_app(),
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "8080")),
+    )
